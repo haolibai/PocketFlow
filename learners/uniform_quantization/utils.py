@@ -18,7 +18,7 @@
 
 import tensorflow as tf
 from tensorflow.contrib import graph_editor as ge
-# import pdb
+import pdb
 
 
 def prefix_filter(prefix):
@@ -29,10 +29,11 @@ def prefix_filter(prefix):
 
 class UniformQuantization:
   # pylint: disable=too-many-instance-attributes
-  """ Class of uniform quantization """
+  """ Class of uniform quantization, now support vanilla, dorefa and pact quantization. """
 
-  def __init__(self, sess, bucket_size=0, use_buckets=False, bucket_type='split'):
+  def __init__(self, sess, method='vanilla', bucket_size=0, use_buckets=False, bucket_type='split'):
     self.sess = sess
+    self.method = method
     self.use_buckets = use_buckets
     self.bucket_size = bucket_size
     self.bucket_type = bucket_type
@@ -59,7 +60,6 @@ class UniformQuantization:
                      'Softplus': tf.nn.softplus,
                      'Sigmoid': tf.nn.sigmoid,
                      'Relu6': tf.nn.relu6}
-
     for op in self.activation_ops:
       old_sgv = ge.sgv(op)
       input_ = old_sgv.inputs[0]
@@ -71,7 +71,16 @@ class UniformQuantization:
           raise NotImplementedError("The activation_fn needs to include %s manually" % op.type)
 
         prefix = prefix_filter(op.name)
-        qa = self.__uniform_quantize(tmp_input_, act_bit_dict[op.name], 'activation', prefix)
+        if self.method == 'vanilla':
+          qa = self.__uniform_quantize(tmp_input_, act_bit_dict[op.name], 'activation', prefix)
+        elif self.method == 'dorefa':
+          qa = self.__dorefa_quantize(tmp_input_,  act_bit_dict[op.name], 'activation', prefix)
+        elif self.method == 'pact':
+          qa = self.__pact_quantize(tmp_input_, act_bit_dict[op.name], 'activation', prefix)
+
+        tf.add_to_collection("quant_activations", qa)
+
+        # reroute outputs
         new_sgv = ge.sgv(qa.op)
         ge.reroute_outputs(new_sgv, old_sgv)
         self.quantized_activation_ops.append(qa.op)
@@ -88,7 +97,15 @@ class UniformQuantization:
     for op in self.matmul_ops:
       w = op.inputs[1]
       prefix = prefix_filter(op.name)
-      qw = self.__uniform_quantize(w, w_bit_dict[op.name], 'weight', prefix)
+      if self.method == 'vanilla':
+        qx = self.__uniform_quantize(w, w_bit_dict[op.name], 'weight', prefix)
+      elif self.method == 'dorefa':
+        qx = self.__dorefa_quantize(w, w_bit_dict[op.name], 'weight', prefix)
+      elif self.method == 'pact':
+        qx = self.__pact_quantize(w, w_bit_dict[op.name], 'weight', prefix)
+
+      tf.add_to_collection("quant_weights", qx)
+
       weight_fn = {'MatMul': tf.matmul,
                    'Conv2D': tf.nn.conv2d,
                    'DepthwiseConv2dNative': tf.nn.depthwise_conv2d}
@@ -97,19 +114,19 @@ class UniformQuantization:
         if is_conv_fn(op):
           strides = op.get_attr('strides')
           padding = op.get_attr('padding')
-          qw_op = weight_fn[op.type](op.inputs[0], qw, strides, padding).op
+          qx_op = weight_fn[op.type](op.inputs[0], qx, strides, padding).op
         else:
           # fc layers
-          qw_op = weight_fn[op.type](op.inputs[0], qw).op
-        self.quantized_matmul_ops.append(qw_op)
+          qx_op = weight_fn[op.type](op.inputs[0], qx).op
+        self.quantized_matmul_ops.append(qx_op)
       except KeyError:
         raise NotImplementedError("Unrecognied Mul op, \
             try to add it into matmul_typs for quantization")
 
     # replace input
-    for wop, qwop in zip(self.matmul_ops, self.quantized_matmul_ops):
+    for wop, qxop in zip(self.matmul_ops, self.quantized_matmul_ops):
       old_sgv = ge.sgv(wop)
-      new_sgv = ge.sgv(qwop)
+      new_sgv = ge.sgv(qxop)
       ge.reroute_inputs(new_sgv, old_sgv)
 
   def search_matmul_op(self, quantize_all_layers):
@@ -172,6 +189,9 @@ class UniformQuantization:
     Returns:
     * A Tensor, uniform quantized value
     """
+    if mbits == 32:
+      return x
+
     with tf.variable_scope(prefix + '/quantize'):
       if self.use_buckets and mode == 'weight':
         orig_shape = x.get_shape()
@@ -179,24 +199,142 @@ class UniformQuantization:
           x, bucket_num, padded_num = self.__split_bucket(x)
         elif self.bucket_type == 'channel':
           x, bucket_num, padded_num = self.__channel_bucket(x)
-      x_normalized, alpha, beta = self.__scale(x, mode)
+
+      g = self.sess.graph
+      k = tf.cast(2 ** mbits - 1, tf.float32)
+
+      # clip before scale
+      if mode == 'weight':
+        x = self.__clip_weights(x)
+        with tf.control_dependencies([x]):
+          x_normalized, alpha, beta = self.__scale(x, mode)
+        with g.gradient_override_map({'Round': 'Identity'}):
+          qx = tf.round(x_normalized * k) / k
+          qx = self.__inv_scale(qx, alpha, beta)
+
+      elif mode == 'activation':
+        x_normalized = tf.clip_by_value(x, 0.0, 1.0)
+        with g.gradient_override_map({'Round': 'Identity'}):
+          qx = tf.round(x_normalized * k) / k
+
+      if self.use_buckets and mode == 'weight':
+        # Reshape w back to the original shape
+        qx = tf.reshape(qx, [-1])
+        if padded_num != 0:
+          qx = tf.reshape(qx[:-padded_num], orig_shape)
+        else:
+          qx = tf.reshape(qx, orig_shape)
+        # Update bucket storage if use buckets.
+        self.__updt_bucket_storage(bucket_num)
+
+      print("Quantized: " + tf.get_variable_scope().name)
+      return qx
+
+  def __dorefa_quantize(self, x, mbits, mode, prefix=''):
+    """ DoReFa quantization function
+
+    Args:
+    * x: A Tensor (weights or activation output)
+    * mbits: A scalar Tensor, tf.int64, spicifying number of bit for quantization
+    * mode: A string, 'weight' or 'activation', where to quantize
+    * prefix: A string, the prefix of scope name
+
+    Returns:
+    * A Tensor, uniform quantized value
+    """
+    if mbits == 32:
+      return x
+
+    with tf.variable_scope(prefix + '/quantize'):
+      if self.use_buckets and mode == 'weight':
+        orig_shape = x.get_shape()
+        if self.bucket_type == 'split':
+          x, bucket_num, padded_num = self.__split_bucket(x)
+        elif self.bucket_type == 'channel':
+          x, bucket_num, padded_num = self.__channel_bucket(x)
+
+      g = self.sess.graph
+      k = tf.cast(2 ** mbits - 1, tf.float32)
+
+      if mode == 'weight':
+        # Equation (9) in the paper
+        x_normalized = tf.tanh(x) / (2 * tf.reduce_max(tf.abs(tf.tanh(x)))) + 0.5
+        with g.gradient_override_map({'Round': 'Identity'}):
+          # in DoReFa, qx is in [-1, 1]
+          qx = 2 * tf.round(x_normalized * k) / k - 1
+
+      elif mode == 'activation':
+        # NOTE: pass through ReLU1() gives worse performance on 32-bit act
+        x_normalized = tf.clip_by_value(x, 0.0, 1.0)
+        with g.gradient_override_map({'Round': 'Identity'}):
+          qx = tf.round(x_normalized * k) / k
+
+      if self.use_buckets and mode == 'weight':
+        # Reshape w back to the original shape
+        qx = tf.reshape(qx, [-1])
+        if padded_num != 0:
+          qx = tf.reshape(qx[:-padded_num], orig_shape)
+        else:
+          qx = tf.reshape(qx, orig_shape)
+
+        # Update bucket storage if use buckets.
+        self.__updt_bucket_storage(bucket_num)
+      print("DoReFa Quantized: " + tf.get_variable_scope().name)
+      return qx
+
+  def __pact_quantize(self, x, mbits, mode, prefix=''):
+    """ PACT quantization method, appliable for both weights and act.
+    TODO: does not support bucketing for now.
+
+    Args:
+    * x: A Tensor (weights or activation output)
+    * mbits: A scalar Tensor, tf.int64, spicifying number of bit for quantization
+    * mode: A string, 'weight' or 'activation', where to quantize
+    * prefix: A string, the prefix of scope name
+
+    Returns:
+    * qx: A Tensor, uniform quantized value
+
+    """
+    with tf.variable_scope(prefix + '/quantize'):
+
+      if mbits == 32:
+        return x
+
+      if mode == 'weight':
+        # weight normalize, similar to BN
+        # TODO: if bucket is true, x_mean, x_std should be vectors.
+        x_mean = tf.stop_gradien(tf.reduce_mean(x))
+        x_std = tf.stop_gradien(tf.sqrt(tf.reduce_mean(tf.square(x - x_mean))))
+        x_normalized = (x - x_mean) / (x_std + 1e-8)
+        scale = tf.get_variable(name='pact_scale', initializer=x_std)
+        offset = tf.get_variable(name='pact_offset', initializer=x_mean)
+
+        # initilaize clipping var with 1.5 * x_max
+        thresh = tf.get_variable(name='pact_thresh', initializer=tf.constant(3.))
+        thresh = tf.clip_by_value(thresh, 1e-3, 10)
+        x_pact = tf.clip_by_value(x_normalized, -thresh, thresh)
+
+      elif mode == 'activation':
+        # no need to normalize activations since there are BN layers
+        thresh = tf.get_variable(name='pact_thresh', initializer=tf.constant(10.))
+        thresh = tf.clip_by_value(thresh, 1e-3, 10)
+        # x_pact = 0.5 * (tf.abs(x_normalized) - tf.abs(x_normalized - thresh) + thresh)
+        x_pact = tf.clip_by_value(x, 0., thresh)
+      else:
+        raise ValueError("Unknown quantization mode for pact")
+
       g = self.sess.graph
       k = tf.cast(2 ** mbits - 1, tf.float32)
       with g.gradient_override_map({'Round': 'Identity'}):
-        qw = tf.round(x_normalized * k) / k
-      qw = self.__inv_scale(qw, alpha, beta)
-      if self.use_buckets and mode == 'weight':
-        # Reshape w back to the original shape
-        qw = tf.reshape(qw, [-1])
-        if padded_num != 0:
-          qw = tf.reshape(qw[:-padded_num], orig_shape)
-        else:
-          qw = tf.reshape(qw, orig_shape)
+        qx = thresh * tf.round(x_pact * k / thresh) / k
 
-       # Update bucket storage if use buckets.
-        self.__updt_bucket_storage(bucket_num)
-      print("Quantized: " + tf.get_variable_scope().name)
-      return qw
+      if mode == 'weight':
+        # NOTE: scale weights back, according to yuhang, this is not necessary
+        qx = scale * qx + offset
+
+      print("PACT Quantized: " + tf.get_variable_scope().name)
+      return qx
 
   def __scale(self, w, mode):
     """linear scale function
@@ -224,7 +362,7 @@ class UniformQuantization:
     w_max = tf.stop_gradient(tf.reduce_max(w, axis=axis))
     w_min = tf.stop_gradient(tf.reduce_min(w, axis=axis))
     eps = tf.constant(value=1e-10, dtype=tf.float32)
-    
+
     alpha = w_max - w_min + eps
     beta = w_min
     w = (w - beta) / alpha
@@ -293,8 +431,9 @@ class UniformQuantization:
 
     if self.bucket_size < 0:
       raise ValueError("Bucket size must be a postive integer")
-    if self.bucket_type != 'split' and self.bucket_type != 'channel':
+    if self.bucket_type not in ['split', 'channel']:
       raise ValueError("Unrecognized bucket type, must be 'weight' or 'channel'.")
+    assert self.method in ['vanilla', 'dorefa', 'pact'], NotImplementedError("Unknown uniform quantization method")
 
   def __updt_bucket_storage(self, bucket_num):
     """ Calculate extra storage for the bucket scalling factors
@@ -305,4 +444,24 @@ class UniformQuantization:
     """
     self.bucket_storage += bucket_num * 32 * 2 # both alpha and beta, so *2
 
+  # New features
+  def __clip_weights(self, x):
+    """ Clipping weights
+    Args:
+    * x: a Tensor, weights or activations
+    * mode: a indicator, ['weight', 'activation']
+    """
+    x_mean = tf.reduce_mean(x)
+    x_std = tf.sqrt(tf.reduce_mean(tf.square(x - x_mean)))
+    x_max = tf.reduce_max(x)
+    x_min = tf.reduce_min(x)
+    # by hanyu's trick
+    trunc = 3
+    ub, lb = tf.where(tf.less_equal(x_mean+trunc*x_std, x_max), x_mean+trunc*x_std, x_max), \
+        tf.where(tf.greater_equal(x_mean-trunc*x_std, x_min), x_mean-trunc*x_std, x_min)
+    x_clip = tf.clip_by_value(x, lb, ub)
+    return x_clip
+
+  def __clip_activations(self, x):
+    raise NotImplementedError
 

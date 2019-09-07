@@ -29,6 +29,7 @@ from learners.abstract_learner import AbstractLearner
 from learners.distillation_helper import DistillationHelper
 from learners.uniform_quantization.utils import UniformQuantization
 from learners.uniform_quantization.bit_optimizer import BitOptimizer
+import pdb
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -37,6 +38,9 @@ tf.app.flags.DEFINE_integer('uql_weight_bits', 4, \
     'Number of bits to use for quantizing weights')
 tf.app.flags.DEFINE_integer('uql_activation_bits', 32, \
     'Number of bits to use for quantizing activations')
+tf.app.flags.DEFINE_string('uql_method', 'vanilla', 'uniform quantization method:\
+    [vanilla, dorefa, pact]')
+tf.app.flags.DEFINE_float('uql_thresh_lam', 1e-2, 'thresh decay param for pact')
 tf.app.flags.DEFINE_boolean('uql_use_buckets', False, 'Use bucketing or not')
 tf.app.flags.DEFINE_integer('uql_bucket_size', 256, 'Number of bucket size')
 tf.app.flags.DEFINE_integer('uql_quant_epochs', 60, 'To be determined by datasets')
@@ -53,11 +57,18 @@ def setup_bnds_decay_rates(model_name, dataset_name):
   batch_size = FLAGS.batch_size if not FLAGS.enbl_multi_gpu else FLAGS.batch_size * mgw.size()
   nb_batches_per_epoch = int(FLAGS.nb_smpls_train / batch_size)
   mgw_size = int(mgw.size()) if FLAGS.enbl_multi_gpu else 1
-  init_lr = FLAGS.lrn_rate_init * FLAGS.batch_size * mgw_size / FLAGS.batch_size_norm if FLAGS.enbl_multi_gpu else FLAGS.lrn_rate_init
+  init_lr = FLAGS.lrn_rate_init * FLAGS.batch_size * mgw_size / FLAGS.batch_size_norm \
+      if FLAGS.enbl_multi_gpu else FLAGS.lrn_rate_init
   if dataset_name == 'cifar_10':
     if model_name.startswith('resnet'):
-      bnds = [nb_batches_per_epoch * 15, nb_batches_per_epoch * 40]
-      decay_rates = [1e-3, 1e-4, 1e-5]
+      if FLAGS.enbl_warm_start:
+        bnds = [nb_batches_per_epoch * 15, nb_batches_per_epoch * 40]
+        decay_rates = [1e-3, 1e-4, 1e-5]
+      else:
+        bnds = [nb_batches_per_epoch * 80, nb_batches_per_epoch * 120, \
+            nb_batches_per_epoch * 160]
+        decay_rates = [1e-3, 1e-4, 1e-5, 1e-6]
+
   elif dataset_name == 'ilsvrc_12':
     if model_name.startswith('resnet'):
       bnds = [nb_batches_per_epoch * 5, nb_batches_per_epoch * 20]
@@ -97,25 +108,19 @@ class UniformQuantLearner(AbstractLearner):
     self.auto_barrier()
 
     # determine the optimal policy.
-    bit_optimizer = BitOptimizer(self.dataset_name,
-                                 self.weights,
-                                 self.statistics,
-                                 self.bit_placeholders,
-                                 self.ops,
-                                 self.layerwise_tune_list,
-                                 self.sess_train,
-                                 self.sess_eval,
-                                 self.saver_train,
-                                 self.saver_eval,
-                                 self.auto_barrier)
-    self.optimal_w_bit_list, self.optimal_a_bit_list = bit_optimizer.run()
+    self.w_bits = [FLAGS.uql_weight_bits] * self.statistics['nb_matmuls']
+    self.a_bits = [FLAGS.uql_activation_bits] * self.statistics['nb_activations']
     self.auto_barrier()
 
   def train(self):
+
+    # build the quantization bits
+    feed_dict = {self.bit_placeholders['w_train']: self.w_bits,
+                 self.bit_placeholders['a_train']: self.a_bits}
     # initialization
     self.sess_train.run(self.ops['init'])
-    # mgw_size = int(mgw.size()) if FLAGS.enbl_multi_gpu else 1
 
+    # mgw_size = int(mgw.size()) if FLAGS.enbl_multi_gpu else 1
     total_iters = self.finetune_steps
     if  FLAGS.enbl_warm_start:
       self.__restore_model(is_train=True) # use the latest model for warm start
@@ -126,9 +131,6 @@ class UniformQuantLearner(AbstractLearner):
       self.sess_train.run(self.ops['bcast'])
 
     time_prev = timer()
-    # build the quantization bits
-    feed_dict = {self.bit_placeholders['w_train']: self.optimal_w_bit_list,
-                 self.bit_placeholders['a_train']: self.optimal_a_bit_list}
 
     for idx_iter in range(total_iters):
       # train the model
@@ -139,6 +141,10 @@ class UniformQuantLearner(AbstractLearner):
                                                     self.ops['summary'],
                                                     self.ops['log']],
                                                    feed_dict=feed_dict)
+        if FLAGS.uql_method == 'pact':
+          thresh_decy = self.sess_train.run(self.thresh_decy)
+          print('Thresh decay loss: %e' % thresh_decy)
+
         time_prev = self.__monitor_progress(summary, log_rslt, time_prev, idx_iter)
 
       # save & evaluate the model at certain steps
@@ -162,8 +168,8 @@ class UniformQuantLearner(AbstractLearner):
     nb_iters = int(np.ceil(float(FLAGS.nb_smpls_eval) / FLAGS.batch_size_eval))
 
     # build the quantization bits
-    feed_dict = {self.bit_placeholders['w_eval']: self.optimal_w_bit_list,
-                 self.bit_placeholders['a_eval']: self.optimal_a_bit_list}
+    feed_dict = {self.bit_placeholders['w_eval']: self.w_bits,
+                 self.bit_placeholders['a_eval']: self.a_bits}
 
     for _ in range(nb_iters):
       eval_rslt = self.sess_eval.run(self.ops['eval'], feed_dict=feed_dict)
@@ -172,7 +178,8 @@ class UniformQuantLearner(AbstractLearner):
 
     tf.logging.info('loss: {}'.format(np.mean(np.array(losses))))
     tf.logging.info('accuracy: {}'.format(np.mean(np.array(accuracies))))
-    tf.logging.info("Optimal Weight Quantization:{}".format(self.optimal_w_bit_list))
+    tf.logging.info("Optimal Weight Quantization:{}".format(self.w_bits))
+    tf.logging.info("Optimal Act Quantization:{}".format(self.a_bits))
 
     if FLAGS.uql_use_buckets:
       bucket_storage = self.sess_eval.run(self.ops['bucket_storage'], feed_dict=feed_dict)
@@ -202,16 +209,28 @@ class UniformQuantLearner(AbstractLearner):
         # forward pass
         logits = self.forward_train(images)
 
+        # weights to be quantized
         self.weights = [v for v in self.trainable_vars if 'kernel' in v.name or 'weight' in v.name]
         if not FLAGS.uql_quantize_all_layers:
           self.weights = self.weights[1:-1]
         self.statistics['num_weights'] = \
             [tf.reshape(v, [-1]).shape[0].value for v in self.weights]
 
+        self.saver_train = tf.train.Saver(self.vars)
         self.__quantize_train_graph()
 
         # loss & accuracy
         loss, metrics = self.calc_loss(labels, logits, self.trainable_vars)
+        # FIXME: weight_decay loss already includes pact vars.
+
+        if FLAGS.uql_method == 'pact':
+          # L2 -decay on threshold
+          thresh_vars = [v for v in self.pact_vars if 'pact' in v.name]
+          self.thresh_decy = 0.
+          for t in thresh_vars:
+            self.thresh_decy += FLAGS.uql_thresh_lam * tf.reduce_sum(tf.square(t))
+          loss += self.thresh_decy
+
         if self.dataset_name == 'cifar_10':
           acc_top1, acc_top5 = metrics['accuracy'], tf.constant(0.)
         elif self.dataset_name == 'ilsvrc_12':
@@ -229,8 +248,6 @@ class UniformQuantLearner(AbstractLearner):
         tf.summary.scalar('acc_top1', acc_top1)
         tf.summary.scalar('acc_top5', acc_top5)
 
-        self.saver_train = tf.train.Saver(self.vars)
-
         self.ft_step = tf.get_variable('finetune_step', shape=[], dtype=tf.int32, trainable=False)
 
       # optimizer & gradients
@@ -240,8 +257,10 @@ class UniformQuantLearner(AbstractLearner):
                                              [i for i in bnds],
                                              [init_lr * decay_rate for decay_rate in decay_rates])
 
-      # optimizer = tf.train.MomentumOptimizer(lrn_rate, FLAGS.momentum)
-      optimizer = tf.train.AdamOptimizer(learning_rate=lrn_rate)
+      # NOTE: for act quant, better to train from scratch with momentum
+      optimizer = tf.train.MomentumOptimizer(lrn_rate, FLAGS.momentum)
+      # optimizer = tf.train.AdamOptimizer(learning_rate=lrn_rate)
+
       if FLAGS.enbl_multi_gpu:
         optimizer = mgw.DistributedOptimizer(optimizer)
       grads = optimizer.compute_gradients(loss, self.trainable_vars)
@@ -259,9 +278,10 @@ class UniformQuantLearner(AbstractLearner):
         self.ops['log'] = [lrn_rate, model_loss, loss, acc_top1, acc_top5]
 
       self.ops['reset_ft_step'] = tf.assign(self.ft_step, tf.constant(0, dtype=tf.int32))
+
       self.ops['init'] = tf.global_variables_initializer()
-      self.ops['bcast'] = mgw.broadcast_global_variables(0) if FLAGS.enbl_multi_gpu else None
       self.saver_quant = tf.train.Saver(self.vars)
+      self.ops['bcast'] = mgw.broadcast_global_variables(0) if FLAGS.enbl_multi_gpu else None
 
   def __build_eval(self):
     with tf.Graph().as_default():
@@ -304,13 +324,14 @@ class UniformQuantLearner(AbstractLearner):
           dst_loss = self.helper_dst.calc_loss(logits, logits_dst)
           loss += dst_loss
 
-        # TF operations & model saver
-        self.ops['eval'] = [loss, acc_top1, acc_top5]
-        self.saver_eval = tf.train.Saver(self.vars)
+      # TF operations & model saver
+      self.ops['eval'] = [loss, acc_top1, acc_top5]
+      self.saver_eval = tf.train.Saver(self.vars)
 
   def __quantize_train_graph(self):
     """ Insert quantization nodes to the training graph. """
     uni_quant = UniformQuantization(self.sess_train,
+                                    FLAGS.uql_method,
                                     FLAGS.uql_bucket_size,
                                     FLAGS.uql_use_buckets,
                                     FLAGS.uql_bucket_type)
@@ -339,9 +360,17 @@ class UniformQuantLearner(AbstractLearner):
     self.layerwise_tune_list = uni_quant.get_layerwise_tune_op(self.weights) \
         if FLAGS.uql_enbl_rl_layerwise_tune else (None, None)
 
+    # obtain quantized weghts/activations and trainable vars
+    self.quant_weights = tf.get_collection("quant_weights")
+    self.quant_activations = tf.get_collection("quant_activations")
+
+    if FLAGS.uql_method == 'pact':
+      self.pact_vars = [v for v in self.trainable_vars if 'pact' in v.name]
+
   def __quantize_eval_graph(self):
     """ Insert quantization nodes to the evaluation graph. """
     uni_quant = UniformQuantization(self.sess_eval,
+                                    FLAGS.uql_method,
                                     FLAGS.uql_bucket_size,
                                     FLAGS.uql_use_buckets,
                                     FLAGS.uql_bucket_type)
@@ -368,6 +397,7 @@ class UniformQuantLearner(AbstractLearner):
     uni_quant.insert_quant_op_for_activations(a_bit_dict_eval)
 
     self.ops['bucket_storage'] = uni_quant.bucket_storage
+    # meaningless to obtain quantized weights and activations in evaluation.
 
   def __save_model(self):
     # early break for non-primary workers
