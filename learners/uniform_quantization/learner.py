@@ -59,15 +59,15 @@ def setup_bnds_decay_rates(model_name, dataset_name):
   mgw_size = int(mgw.size()) if FLAGS.enbl_multi_gpu else 1
   init_lr = FLAGS.lrn_rate_init * FLAGS.batch_size * mgw_size / FLAGS.batch_size_norm \
       if FLAGS.enbl_multi_gpu else FLAGS.lrn_rate_init
-  if dataset_name == 'cifar_10':
+  if dataset_name in ['cifar_10', 'cifar_100']:
     if model_name.startswith('resnet'):
+      bnds = [nb_batches_per_epoch * int(0.4*FLAGS.uql_quant_epochs), \
+              nb_batches_per_epoch * int(0.6*FLAGS.uql_quant_epochs), \
+              nb_batches_per_epoch * int(0.8*FLAGS.uql_quant_epochs)]
       if FLAGS.enbl_warm_start:
-        bnds = [nb_batches_per_epoch * 15, nb_batches_per_epoch * 40]
-        decay_rates = [1e-3, 1e-4, 1e-5]
-      else:
-        bnds = [nb_batches_per_epoch * 80, nb_batches_per_epoch * 120, \
-            nb_batches_per_epoch * 160]
         decay_rates = [1e-3, 1e-4, 1e-5, 1e-6]
+      else:
+        decay_rates = [1, 1e-1, 1e-2, 1e-3]
 
   elif dataset_name == 'ilsvrc_12':
     if model_name.startswith('resnet'):
@@ -108,15 +108,25 @@ class UniformQuantLearner(AbstractLearner):
     self.auto_barrier()
 
     # determine the optimal policy.
-    self.w_bits = [FLAGS.uql_weight_bits] * self.statistics['nb_matmuls']
-    self.a_bits = [FLAGS.uql_activation_bits] * self.statistics['nb_activations']
+    bit_optimizer = BitOptimizer(self.dataset_name,
+                                 self.weights,
+                                 self.statistics,
+                                 self.bit_placeholders,
+                                 self.ops,
+                                 self.layerwise_tune_list,
+                                 self.sess_train,
+                                 self.sess_eval,
+                                 self.saver_train,
+                                 self.saver_eval,
+                                 self.auto_barrier)
+    self.optimal_w_bit_list, self.optimal_a_bit_list = bit_optimizer.run()
     self.auto_barrier()
 
   def train(self):
 
     # build the quantization bits
-    feed_dict = {self.bit_placeholders['w_train']: self.w_bits,
-                 self.bit_placeholders['a_train']: self.a_bits}
+    feed_dict = {self.bit_placeholders['w_train']: self.optimal_w_bit_list,
+                 self.bit_placeholders['a_train']: self.optimal_a_bit_list}
     # initialization
     self.sess_train.run(self.ops['init'])
 
@@ -168,8 +178,8 @@ class UniformQuantLearner(AbstractLearner):
     nb_iters = int(np.ceil(float(FLAGS.nb_smpls_eval) / FLAGS.batch_size_eval))
 
     # build the quantization bits
-    feed_dict = {self.bit_placeholders['w_eval']: self.w_bits,
-                 self.bit_placeholders['a_eval']: self.a_bits}
+    feed_dict = {self.bit_placeholders['w_eval']: self.optimal_w_bit_list,
+                 self.bit_placeholders['a_eval']: self.optimal_a_bit_list}
 
     for _ in range(nb_iters):
       eval_rslt = self.sess_eval.run(self.ops['eval'], feed_dict=feed_dict)
@@ -178,8 +188,8 @@ class UniformQuantLearner(AbstractLearner):
 
     tf.logging.info('loss: {}'.format(np.mean(np.array(losses))))
     tf.logging.info('accuracy: {}'.format(np.mean(np.array(accuracies))))
-    tf.logging.info("Optimal Weight Quantization:{}".format(self.w_bits))
-    tf.logging.info("Optimal Act Quantization:{}".format(self.a_bits))
+    tf.logging.info("Optimal Weight Quantization:{}".format(self.optimal_w_bit_list))
+    tf.logging.info("Optimal Act Quantization:{}".format(self.optimal_a_bit_list))
 
     if FLAGS.uql_use_buckets:
       bucket_storage = self.sess_eval.run(self.ops['bucket_storage'], feed_dict=feed_dict)
@@ -233,6 +243,8 @@ class UniformQuantLearner(AbstractLearner):
 
         if self.dataset_name == 'cifar_10':
           acc_top1, acc_top5 = metrics['accuracy'], tf.constant(0.)
+        elif self.dataset_name == 'cifar_100':
+          acc_top1, acc_top5 = metrics['acc_top1'], metrics['acc_top5']
         elif self.dataset_name == 'ilsvrc_12':
           acc_top1, acc_top5 = metrics['acc_top1'], metrics['acc_top5']
         else:
@@ -315,6 +327,8 @@ class UniformQuantLearner(AbstractLearner):
         loss, metrics = self.calc_loss(labels, logits, self.trainable_vars)
         if self.dataset_name == 'cifar_10':
           acc_top1, acc_top5 = metrics['accuracy'], tf.constant(0.)
+        elif self.dataset_name ==  'cifar_100':
+          acc_top1, acc_top5 = metrics['acc_top1'], metrics['acc_top5']
         elif self.dataset_name == 'ilsvrc_12':
           acc_top1, acc_top5 = metrics['acc_top1'], metrics['acc_top5']
         else:
@@ -418,7 +432,9 @@ class UniformQuantLearner(AbstractLearner):
         print('Print directory: ' + item)
       self.saver_train.restore(self.sess_train, save_path)
     else:
-      save_path = tf.train.latest_checkpoint(os.path.dirname(FLAGS.uql_save_quant_model_path))
+      # save_path = tf.train.latest_checkpoint(os.path.dirname(FLAGS.uql_save_quant_model_path))
+      # TODO
+      save_path = tf.train.latest_checkpoint(os.path.dirname(FLAGS.save_path))
       self.saver_eval.restore(self.sess_eval, save_path)
     tf.logging.info('model restored from ' + save_path)
 

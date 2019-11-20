@@ -63,6 +63,7 @@ class UniformQuantization:
     for op in self.activation_ops:
       old_sgv = ge.sgv(op)
       input_ = old_sgv.inputs[0]
+      bit = act_bit_dict[op.name]
 
       if op.type in self.support_act_types:
         try:
@@ -72,12 +73,14 @@ class UniformQuantization:
 
         prefix = prefix_filter(op.name)
         if self.method == 'vanilla':
-          qa = self.__uniform_quantize(tmp_input_, act_bit_dict[op.name], 'activation', prefix)
+          qa = self.__uniform_quantize(tmp_input_, bit, 'activation', prefix)
         elif self.method == 'dorefa':
-          qa = self.__dorefa_quantize(tmp_input_,  act_bit_dict[op.name], 'activation', prefix)
+          qa = self.__dorefa_quantize(tmp_input_,  bit, 'activation', prefix)
         elif self.method == 'pact':
-          qa = self.__pact_quantize(tmp_input_, act_bit_dict[op.name], 'activation', prefix)
+          qa = self.__pact_quantize(tmp_input_, bit, 'activation', prefix)
 
+        # if full precision, directly use unquantized input
+        qa = tf.where(tf.equal(bit, 32), tmp_input_, qa)
         tf.add_to_collection("quant_activations", qa)
 
         # reroute outputs
@@ -97,13 +100,17 @@ class UniformQuantization:
     for op in self.matmul_ops:
       w = op.inputs[1]
       prefix = prefix_filter(op.name)
-      if self.method == 'vanilla':
-        qx = self.__uniform_quantize(w, w_bit_dict[op.name], 'weight', prefix)
-      elif self.method == 'dorefa':
-        qx = self.__dorefa_quantize(w, w_bit_dict[op.name], 'weight', prefix)
-      elif self.method == 'pact':
-        qx = self.__pact_quantize(w, w_bit_dict[op.name], 'weight', prefix)
+      bit = w_bit_dict[op.name]
 
+      if self.method == 'vanilla':
+        qx = self.__uniform_quantize(w, bit, 'weight', prefix)
+      elif self.method == 'dorefa':
+        qx = self.__dorefa_quantize(w, bit, 'weight', prefix)
+      elif self.method == 'pact':
+        qx = self.__pact_quantize(w, bit, 'weight', prefix)
+
+      # if full precision, directly use unquantized input
+      qx = tf.where(tf.equal(bit, 32), w, qx)
       tf.add_to_collection("quant_weights", qx)
 
       weight_fn = {'MatMul': tf.matmul,
@@ -189,9 +196,6 @@ class UniformQuantization:
     Returns:
     * A Tensor, uniform quantized value
     """
-    if mbits == 32:
-      return x
-
     with tf.variable_scope(prefix + '/quantize'):
       if self.use_buckets and mode == 'weight':
         orig_shape = x.get_shape()
@@ -445,7 +449,7 @@ class UniformQuantization:
     self.bucket_storage += bucket_num * 32 * 2 # both alpha and beta, so *2
 
   # New features
-  def __clip_weights(self, x):
+  def __clip_weights(self, x, mode=None):
     """ Clipping weights
     Args:
     * x: a Tensor, weights or activations
